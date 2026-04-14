@@ -56,6 +56,7 @@ is installed.  This script ignores it except to verify it's >= 525.
 from __future__ import annotations
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -90,9 +91,22 @@ def sh(cmd: str, check: bool = True, capture: bool = False) -> str:
 
 def in_env(env_name: str, cmd: str, check: bool = True, capture: bool = False) -> str:
     """Run `cmd` inside the given conda env (whether or not we're in one now)."""
-    # `conda run -n <env>` runs without needing to source conda.sh
-    full = f"conda run -n {env_name} --no-capture-output bash -c {repr(cmd)}"
+    # `conda run -n <env>` runs without needing to source conda.sh.
+    # NOTE: must use shlex.quote() (NOT Python's repr()) -- repr() produces
+    # \-escaped single quotes which are NOT valid bash syntax, leading to
+    # silently-malformed commands and false positives in existence checks.
+    full = f"conda run -n {env_name} --no-capture-output bash -c {shlex.quote(cmd)}"
     return sh(full, check=check, capture=capture)
+
+def env_has_module(env_name: str, module: str) -> bool:
+    """Return True iff `import <module>` succeeds inside the env.
+    Uses the EXIT CODE, not stdout matching, so it's robust to weird
+    error messages that happen to contain literal substrings."""
+    rc = subprocess.call(
+        ["conda", "run", "-n", env_name, "python", "-c", f"import {module}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return rc == 0
 
 # ---------- prechecks ------------------------------------------------------- #
 
@@ -155,33 +169,42 @@ def create_or_update_env(env_name: str, env_yml: str | None, use_existing: bool)
             sh(f"conda create -n {env_name} python=3.12 -y")
             ok("fresh env created with python 3.12")
 
+def env_prefix(env_name: str) -> str:
+    """Absolute path to the env (e.g. /home/x/.conda/envs/fireants).
+    `conda run` does NOT set $CONDA_PREFIX to the env path -- it inherits
+    from the parent shell -- so we ask Python inside the env for sys.prefix."""
+    p = subprocess.run(
+        ["conda", "run", "-n", env_name, "python", "-c",
+         "import sys; print(sys.prefix)"],
+        capture_output=True, text=True, check=True,
+    )
+    return p.stdout.strip()
+
+def env_has_executable(env_name: str, exe: str) -> bool:
+    """True iff <env-prefix>/bin/<exe> exists and is executable."""
+    return os.access(os.path.join(env_prefix(env_name), "bin", exe), os.X_OK)
+
 def install_pip_packages(env_name: str):
     """PyTorch + fireants come from pip, not conda, because we need the
     cu121 wheel and a specific fireants version."""
     step("Installing PyTorch (cu121) and fireants")
-    have_torch = "ok" in in_env(env_name,
-        "python -c 'import torch; print(\"ok\", torch.__version__, torch.version.cuda)'",
-        check=False, capture=True)
-    if have_torch:
+    if env_has_module(env_name, "torch"):
         ok("torch already installed (skipping)")
     else:
         in_env(env_name,
                "pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121")
+        ok("torch installed")
 
-    have_fireants = "ok" in in_env(env_name,
-        "python -c 'import fireants; print(\"ok\")'", check=False, capture=True)
-    if have_fireants:
+    if env_has_module(env_name, "fireants"):
         ok("fireants already installed (skipping)")
     else:
         in_env(env_name, "pip install fireants==1.4.0")
+        ok("fireants installed")
 
 def install_compiler_stack(env_name: str):
     """cuda-toolkit -> nvcc.  gcc 12 -> CUDA-compatible host compiler."""
     step("Installing CUDA toolkit (nvcc) into the env")
-    have_nvcc = in_env(env_name,
-        "test -x $CONDA_PREFIX/bin/nvcc && echo HAVE",
-        check=False, capture=True).strip().endswith("HAVE")
-    if have_nvcc:
+    if env_has_executable(env_name, "nvcc"):
         ok("nvcc already in env (skipping cuda-toolkit install)")
     else:
         # Use NVIDIA's own channel for the exact 12.1.1 build.
@@ -189,10 +212,7 @@ def install_compiler_stack(env_name: str):
         ok("cuda-toolkit 12.1 installed")
 
     step("Installing gcc/gxx 12 into the env (CUDA 12.1 needs gcc <= 13)")
-    have_gcc = in_env(env_name,
-        "test -x $CONDA_PREFIX/bin/gcc && echo HAVE",
-        check=False, capture=True).strip().endswith("HAVE")
-    if have_gcc:
+    if env_has_executable(env_name, "gcc"):
         ok("env-local gcc already installed (skipping)")
     else:
         sh(f"conda install -n {env_name} -c conda-forge gcc=12 gxx=12 -y")
@@ -216,34 +236,49 @@ def build_fused_ops(env_name: str, repo: Path, compute_cap: str):
     if not fused_dir.is_dir():
         die(f"fused_ops dir missing: {fused_dir}")
 
-    # Set CUDA_HOME and TORCH_CUDA_ARCH_LIST for the build, then run the
-    # two-step setup.py that the fused_ops README documents.
-    build_cmd = (
-        f"cd {fused_dir} && "
-        f"export CUDA_HOME=$CONDA_PREFIX && "
-        f'export TORCH_CUDA_ARCH_LIST="{compute_cap}" && '
-        f"python setup.py build_ext && "
-        f"python setup.py install"
+    # IMPORTANT: `conda run` inherits CONDA_PREFIX from the parent shell
+    # (it does NOT set it to the target env), so we must resolve the env's
+    # path explicitly and set CUDA_HOME from that.
+    prefix = env_prefix(env_name)
+    info(f"CUDA_HOME -> {prefix}")
+    info(f"TORCH_CUDA_ARCH_LIST -> {compute_cap}")
+    p = subprocess.run(
+        ["conda", "run", "-n", env_name, "--no-capture-output",
+         "bash", "-c",
+         f'cd {shlex.quote(str(fused_dir))} && '
+         f'python setup.py build_ext && '
+         f'python setup.py install'],
+        env={**os.environ,
+             "CUDA_HOME": prefix,
+             "TORCH_CUDA_ARCH_LIST": compute_cap},
     )
-    in_env(env_name, build_cmd)
+    if p.returncode != 0:
+        die(f"fused_ops build failed (exit {p.returncode}). See output above.")
     ok("build + install complete")
 
 def verify(env_name: str):
     step("Verifying fireants_fused_ops loads and runs")
+    # Run python with the test script as a single argv element -- no shell
+    # quoting involved, so it can't be silently broken.
     test = (
-        "import torch; "                       # must import torch FIRST so libc10 loads
-        "import fireants_fused_ops as ffo; "
-        "from fireants.interpolator import fireants_interpolator as fi; "
-        "img = torch.randn(1,1,16,16,16).cuda(); "
-        "disp = torch.randn(1,16,16,16,3).cuda()*0.01; "
-        "out = fi(img, grid=disp); "
-        "print('OK:', out.shape, ffo.__file__)"
+        "import torch\n"                       # must import torch FIRST so libc10 loads
+        "import fireants_fused_ops as ffo\n"
+        "from fireants.interpolator import fireants_interpolator as fi\n"
+        "img = torch.randn(1,1,16,16,16).cuda()\n"
+        "disp = torch.randn(1,16,16,16,3).cuda()*0.01\n"
+        "out = fi(img, grid=disp)\n"
+        "print('OK:', out.shape, ffo.__file__)\n"
     )
-    out = in_env(env_name, f"python -c \"{test}\"", capture=True)
-    if "OK:" in out:
-        ok(out.splitlines()[-1])
+    p = subprocess.run(
+        ["conda", "run", "-n", env_name, "--no-capture-output",
+         "python", "-c", test],
+        capture_output=True, text=True,
+    )
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode == 0 and "OK:" in out:
+        ok([ln for ln in out.splitlines() if ln.startswith("OK:")][-1])
     else:
-        die(f"verification failed:\n{out}")
+        die(f"verification failed (exit {p.returncode}):\n{out}")
 
 # ---------- main ------------------------------------------------------------ #
 
