@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Build artifacts (in case anyone runs builds in-tree)
+build/
+dist/
+*.so
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local cloned upstream (if user clones FireANTs into the repo dir)
+FireANTs/
