@@ -198,8 +198,19 @@ def install_pip_packages(env_name: str):
     if env_has_module(env_name, "fireants"):
         ok("fireants already installed (skipping)")
     else:
-        in_env(env_name, "pip install fireants==1.4.0")
-        ok("fireants installed")
+        # fireants 1.4.0 hard-pins `simpleitk==2.2.1`, which has been
+        # un-published from PyPI for python >=3.12 (only 2.1.0 and 2.3.0+
+        # have wheels now).  Install a compatible SimpleITK + the other
+        # runtime deps first, then install fireants with --no-deps so pip
+        # doesn't insist on 2.2.1.  Any SimpleITK 2.x works at runtime --
+        # this was verified on a working install with SimpleITK 2.5.2.
+        info("Installing fireants runtime deps (working around simpleitk==2.2.1 pin)")
+        in_env(env_name,
+               "pip install 'simpleitk>=2.3,<3' hydra-core typing "
+               "matplotlib nibabel 'numpy<2' pandas pytest "
+               "scikit-image scipy tqdm")
+        in_env(env_name, "pip install --no-deps fireants==1.4.0")
+        ok("fireants installed (with SimpleITK >=2.3 instead of pinned 2.2.1)")
 
 def install_compiler_stack(env_name: str):
     """cuda-toolkit -> nvcc.  gcc 12 -> CUDA-compatible host compiler."""
