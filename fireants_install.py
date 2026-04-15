@@ -247,21 +247,58 @@ def build_fused_ops(env_name: str, repo: Path, compute_cap: str):
     if not fused_dir.is_dir():
         die(f"fused_ops dir missing: {fused_dir}")
 
-    # IMPORTANT: `conda run` inherits CONDA_PREFIX from the parent shell
-    # (it does NOT set it to the target env), so we must resolve the env's
-    # path explicitly and set CUDA_HOME from that.
+    # IMPORTANT: `conda run` inherits CONDA_PREFIX and PATH from the parent
+    # shell -- it does NOT set them to the target env.  Two things break if
+    # we don't force them manually:
+    #   1. CUDA_HOME=$CONDA_PREFIX would point to base, not the env.
+    #   2. If base conda also has an x86_64-conda-linux-gnu-cc wrapper on
+    #      PATH (happens when base has gcc too, sometimes newer than 12),
+    #      torch's cpp_extension grabs it via `shutil.which("c++")` and
+    #      passes it to nvcc with `-ccbin`, which nvcc rejects because
+    #      CUDA 12.1 only supports gcc <=12.
+    # Fix: prepend the env's bin/ to PATH and pin CC/CXX explicitly.
     prefix = env_prefix(env_name)
-    info(f"CUDA_HOME -> {prefix}")
-    info(f"TORCH_CUDA_ARCH_LIST -> {compute_cap}")
+    env_bin = os.path.join(prefix, "bin")
+    # Prefer the conda-forge toolchain wrappers (x86_64-conda-linux-gnu-gcc)
+    # when present -- they're what torch's cpp_extension looks for first.
+    def pick(*names):
+        for n in names:
+            path = os.path.join(env_bin, n)
+            if os.access(path, os.X_OK):
+                return path
+        return None
+    cc  = pick("x86_64-conda-linux-gnu-cc", "x86_64-conda-linux-gnu-gcc", "gcc")
+    cxx = pick("x86_64-conda-linux-gnu-c++", "x86_64-conda-linux-gnu-g++", "g++")
+    if cc is None or cxx is None:
+        die(f"No gcc/g++ found in {env_bin}.  "
+            f"Rerun with --use-existing after ensuring gcc=12/gxx=12 are installed.")
+
+    info(f"CUDA_HOME             -> {prefix}")
+    info(f"TORCH_CUDA_ARCH_LIST  -> {compute_cap}")
+    info(f"CC                    -> {cc}")
+    info(f"CXX                   -> {cxx}")
+
+    build_env = {
+        **os.environ,
+        "CUDA_HOME":            prefix,
+        "TORCH_CUDA_ARCH_LIST": compute_cap,
+        "CC":                   cc,
+        "CXX":                  cxx,
+        # Belt-and-braces: also tell nvcc directly which host compiler to use,
+        # in case torch's cpp_extension passes a different -ccbin from PATH.
+        "NVCC_PREPEND_FLAGS":   f"-ccbin {cxx}",
+        # Put the env's bin FIRST so any `shutil.which()` inside
+        # setup.py / cpp_extension finds env-local tools before base's.
+        "PATH":                 env_bin + os.pathsep + os.environ.get("PATH", ""),
+    }
+
     p = subprocess.run(
         ["conda", "run", "-n", env_name, "--no-capture-output",
          "bash", "-c",
          f'cd {shlex.quote(str(fused_dir))} && '
          f'python setup.py build_ext && '
          f'python setup.py install'],
-        env={**os.environ,
-             "CUDA_HOME": prefix,
-             "TORCH_CUDA_ARCH_LIST": compute_cap},
+        env=build_env,
     )
     if p.returncode != 0:
         die(f"fused_ops build failed (exit {p.returncode}). See output above.")
