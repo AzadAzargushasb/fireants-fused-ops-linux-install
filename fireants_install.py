@@ -247,18 +247,30 @@ def build_fused_ops(env_name: str, repo: Path, compute_cap: str):
     if not fused_dir.is_dir():
         die(f"fused_ops dir missing: {fused_dir}")
 
-    # IMPORTANT: `conda run` inherits CONDA_PREFIX and PATH from the parent
-    # shell -- it does NOT set them to the target env.  Two things break if
-    # we don't force them manually:
-    #   1. CUDA_HOME=$CONDA_PREFIX would point to base, not the env.
-    #   2. If base conda also has an x86_64-conda-linux-gnu-cc wrapper on
-    #      PATH (happens when base has gcc too, sometimes newer than 12),
-    #      torch's cpp_extension grabs it via `shutil.which("c++")` and
-    #      passes it to nvcc with `-ccbin`, which nvcc rejects because
-    #      CUDA 12.1 only supports gcc <=12.
-    # Fix: prepend the env's bin/ to PATH and pin CC/CXX explicitly.
+    # Two separate hazards when building torch CUDA extensions inside conda:
+    #
+    #   1. `conda run -n <env>` doesn't isolate the env -- it inherits (and
+    #      keeps) anything the parent's base-env activate.d scripts set.
+    #      If base conda also has gcc installed, CC/CXX may already point at
+    #      /opt/miniconda3/bin/x86_64-conda-linux-gnu-c++ (a gcc >=13), and
+    #      the base activate scripts re-set them even if we pass CC/CXX in
+    #      the subprocess env.  CUDA 12.1 requires gcc <=12 -> build fails.
+    #
+    #   2. torch's cpp_extension passes `-ccbin <CXX>` to nvcc inline.  If
+    #      we use NVCC_PREPEND_FLAGS to inject our own -ccbin, it lands
+    #      BEFORE torch's and loses (nvcc's "last -ccbin wins").  We have
+    #      to APPEND instead.
+    #
+    # Workaround: bypass `conda run` entirely, invoke the env's python by
+    # absolute path, and pass an explicit, minimal env= with the env's
+    # compilers and PATH.  Use NVCC_APPEND_FLAGS so our -ccbin overrides
+    # whatever torch picked.
     prefix = env_prefix(env_name)
     env_bin = os.path.join(prefix, "bin")
+    env_python = os.path.join(env_bin, "python")
+    if not os.access(env_python, os.X_OK):
+        die(f"env python not found at {env_python}")
+
     # Prefer the conda-forge toolchain wrappers (x86_64-conda-linux-gnu-gcc)
     # when present -- they're what torch's cpp_extension looks for first.
     def pick(*names):
@@ -273,35 +285,47 @@ def build_fused_ops(env_name: str, repo: Path, compute_cap: str):
         die(f"No gcc/g++ found in {env_bin}.  "
             f"Rerun with --use-existing after ensuring gcc=12/gxx=12 are installed.")
 
+    info(f"env python            -> {env_python}")
     info(f"CUDA_HOME             -> {prefix}")
     info(f"TORCH_CUDA_ARCH_LIST  -> {compute_cap}")
     info(f"CC                    -> {cc}")
     info(f"CXX                   -> {cxx}")
+    info("(bypassing `conda run` to avoid base-env activate.d overriding CC/CXX)")
 
+    # Strip any /*miniconda*/bin entries from the inherited PATH so they
+    # can't be discovered by shutil.which() fallbacks.
+    parent_path = os.environ.get("PATH", "")
+    cleaned_path = os.pathsep.join(
+        p for p in parent_path.split(os.pathsep)
+        if p and "miniconda" not in p.lower() and "anaconda" not in p.lower()
+    )
     build_env = {
-        **os.environ,
+        # Carry over only the bits we need; do NOT splat os.environ -- that
+        # would pull CC/CXX/CONDA_* that the base env set for its own gcc.
+        "HOME":                 os.environ.get("HOME", ""),
+        "USER":                 os.environ.get("USER", ""),
+        "LANG":                 os.environ.get("LANG", "C.UTF-8"),
+        "TERM":                 os.environ.get("TERM", "xterm"),
         "CUDA_HOME":            prefix,
         "TORCH_CUDA_ARCH_LIST": compute_cap,
         "CC":                   cc,
         "CXX":                  cxx,
-        # Belt-and-braces: also tell nvcc directly which host compiler to use,
-        # in case torch's cpp_extension passes a different -ccbin from PATH.
-        "NVCC_PREPEND_FLAGS":   f"-ccbin {cxx}",
-        # Put the env's bin FIRST so any `shutil.which()` inside
-        # setup.py / cpp_extension finds env-local tools before base's.
-        "PATH":                 env_bin + os.pathsep + os.environ.get("PATH", ""),
+        # Append our -ccbin so it wins over torch's (nvcc: last wins).
+        "NVCC_APPEND_FLAGS":    f"-ccbin {cxx}",
+        # Env bin first; base-conda bins removed.
+        "PATH":                 env_bin + os.pathsep + cleaned_path,
     }
 
-    p = subprocess.run(
-        ["conda", "run", "-n", env_name, "--no-capture-output",
-         "bash", "-c",
-         f'cd {shlex.quote(str(fused_dir))} && '
-         f'python setup.py build_ext && '
-         f'python setup.py install'],
-        env=build_env,
-    )
-    if p.returncode != 0:
-        die(f"fused_ops build failed (exit {p.returncode}). See output above.")
+    # Run setup.py directly with the env's python -- no shell, no conda run.
+    for subcmd in (["build_ext"], ["install"]):
+        p = subprocess.run(
+            [env_python, "setup.py", *subcmd],
+            cwd=str(fused_dir),
+            env=build_env,
+        )
+        if p.returncode != 0:
+            die(f"fused_ops `setup.py {' '.join(subcmd)}` failed (exit {p.returncode}). "
+                f"See output above.")
     ok("build + install complete")
 
 def verify(env_name: str):
