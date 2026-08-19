@@ -1,0 +1,21 @@
+# Optional neuroimaging / statistics stack, installed by
+#     fireants_install.py --with-analysis-stack
+#
+# This is what a typical FireANTs registration pipeline needs around it, on
+# top of requirements-fireants.txt.  All of it resolves under the numpy<2
+# constraint in constraints.txt.
+#
+# nipype.interfaces.fsl additionally needs FSL itself installed on the system
+# (FSLDIR set, $FSLDIR/bin on PATH) -- it is not a pip package.
+
+networkx>=2.6
+plotly>=5.0,<6
+kaleido==0.2.1        # pre-1.0 static-image engine; matches plotly<6
+jupyter
+ipykernel             # required for the JupyterLab kernel registration
+pingouin
+statsmodels
+joblib
+scikit-learn
+nipype
+nilearn

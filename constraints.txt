@@ -1,0 +1,10 @@
+# Global pip constraints, applied to EVERY pip install this repo performs.
+#
+# numpy<2 matches the known-good FireANTs environment (numpy 1.26.4).  It is
+# this repo's choice, not a fireants requirement -- fireants itself declares a
+# bare `numpy`.  Keeping it here means it's a one-line change if a future
+# CUDA/torch lane needs numpy 2.x.
+#
+# Verified: nothing in requirements-analysis.txt declares a numpy>=2 floor on
+# python 3.12 (nilearn's numpy>=1.26.0 is satisfied by 1.26.4).
+numpy<2

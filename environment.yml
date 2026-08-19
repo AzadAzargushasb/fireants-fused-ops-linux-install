@@ -1,0 +1,28 @@
+# Minimal conda environment for FireANTs + fused_ops.
+#
+# Deliberately small: conda provides ONLY the interpreter and the build
+# toolchain.  PyTorch, fireants and the science stack come from pip (see
+# requirements-*.txt), because we need CUDA-flavoured torch wheels that conda
+# doesn't carry.
+#
+# `cuda-toolkit` is intentionally NOT listed here -- which version you need
+# depends on your GPU (CUDA 12.1 for sm_50..sm_90, CUDA 12.8 for Blackwell),
+# so fireants_install.py installs the right one from the NVIDIA channel after
+# detecting the GPU.
+#
+# Contrast with pre_env_from_history.yml, which is a 350-package snapshot of
+# one developer's everyday Anaconda env: slow to solve, pinned to that
+# machine's versions, and gated behind the Anaconda `defaults` Terms of
+# Service.  You do not need it.
+
+name: fireants
+channels:
+  - conda-forge
+  - nodefaults          # skip Anaconda `defaults` entirely -> no ToS gate
+dependencies:
+  - python=3.12         # SimpleITK has no 3.13 wheel as of 2026
+  - pip
+  - tk                  # tkinter -- file dialogs (askdirectory/askopenfilename)
+  - git                 # to clone the FireANTs sources for fused_ops
+  - gcc=12              # valid host compiler for both CUDA 12.1 and 12.8
+  - gxx=12

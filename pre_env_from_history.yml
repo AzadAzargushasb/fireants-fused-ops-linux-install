@@ -1,3 +1,13 @@
+# NOT REQUIRED -- see README ("About pre_env_from_history.yml").
+#
+# This is a snapshot of ONE developer's everyday Anaconda environment (~350
+# packages: spyder, scrapy, qt, mkl, astropy...), almost none of which FireANTs
+# needs.  It solves slowly, pins everything to that machine's versions, and
+# requires accepting the Anaconda `defaults` channel Terms of Service.
+#
+# Use environment.yml instead -- fireants_install.py does by default.
+# This file is kept only for reproducing that specific environment.
+#
 # Exported from a working machine with `conda env export --from-history`.
 # Lists only EXPLICITLY-installed packages (no platform-specific build hashes),
 # so the file is portable across machines.
